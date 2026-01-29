@@ -23,11 +23,43 @@ struct {
   struct run *freelist;
 } kmem;
 
+#ifdef LAB_PGTBL
+// superpage (2 MiB) allocator
+struct superrun {
+  struct superrun *next;
+};
+
+#define SUPERPOOL_PAGES 16
+#define SUPERPOOL_SIZE (SUPERPOOL_PAGES * SUPERPGSIZE)
+
+struct {
+  struct spinlock lock;
+  struct superrun *freelist;
+} superkmem;
+
+static void superfreerange(void *pa_start, void *pa_end);
+#endif
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+#ifdef LAB_PGTBL
+  initlock(&superkmem.lock, "superkmem");
+  // carve memory into normal 4KiB pool and a capped 2MiB superpage pool
+  char *start = (char*)PGROUNDUP((uint64)end);
+  char *super_end = (char*)PHYSTOP;
+  char *superstart = (char*)SUPERPGROUNDUP((uint64)(super_end - SUPERPOOL_SIZE));
+  if(superstart < start)
+    superstart = (char*)SUPERPGROUNDUP((uint64)start);
+
+  if(start < superstart)
+    freerange(start, superstart);
+  if(superstart < super_end)
+    superfreerange(superstart, super_end);
+#else
   freerange(end, (void*)PHYSTOP);
+#endif
 }
 
 void
@@ -38,6 +70,16 @@ freerange(void *pa_start, void *pa_end)
   for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
     kfree(p);
 }
+
+#ifdef LAB_PGTBL
+static void
+superfreerange(void *pa_start, void *pa_end)
+{
+  char *p = (char*)SUPERPGROUNDUP((uint64)pa_start);
+  for(; p + SUPERPGSIZE <= (char*)pa_end; p += SUPERPGSIZE)
+    superfree(p);
+}
+#endif
 
 // Free the page of physical memory pointed at by pa,
 // which normally should have been returned by a
@@ -80,3 +122,40 @@ kalloc(void)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
 }
+
+#ifdef LAB_PGTBL
+// Free one 2MiB superpage.
+void
+superfree(void *pa)
+{
+  struct superrun *r;
+
+  if(((uint64)pa % SUPERPGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    panic("superfree");
+
+  memset(pa, 1, SUPERPGSIZE);
+
+  r = (struct superrun*)pa;
+  acquire(&superkmem.lock);
+  r->next = superkmem.freelist;
+  superkmem.freelist = r;
+  release(&superkmem.lock);
+}
+
+// Allocate one 2MiB superpage.
+void *
+superalloc(void)
+{
+  struct superrun *r;
+
+  acquire(&superkmem.lock);
+  r = superkmem.freelist;
+  if(r)
+    superkmem.freelist = r->next;
+  release(&superkmem.lock);
+
+  if(r)
+    memset((char*)r, 5, SUPERPGSIZE);
+  return (void*)r;
+}
+#endif
