@@ -77,9 +77,51 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
+  if((which_dev == 2) && (p->sigalarm_frame.in_handler == 0)){
+    p->sigalarm_frame.tick_counter++;
+    if ((p->sigalarm_frame.ticks)&&(p->sigalarm_frame.tick_counter == p->sigalarm_frame.ticks)){
+      p->sigalarm_frame.in_handler = 1;
+      p->sigalarm_frame.tick_counter = 0;
 
+      p->sigalarm_frame.ra = p->trapframe->ra;
+      p->sigalarm_frame.sp = p->trapframe->sp;
+      p->sigalarm_frame.gp = p->trapframe->gp;
+      p->sigalarm_frame.tp = p->trapframe->tp;
+
+      p->sigalarm_frame.t0 = p->trapframe->t0;
+      p->sigalarm_frame.t1 = p->trapframe->t1;
+      p->sigalarm_frame.t2 = p->trapframe->t2;
+      p->sigalarm_frame.t3 = p->trapframe->t3;
+      p->sigalarm_frame.t4 = p->trapframe->t4;
+      p->sigalarm_frame.t5 = p->trapframe->t5;
+      p->sigalarm_frame.t6 = p->trapframe->t6;
+
+      p->sigalarm_frame.a0 = p->trapframe->a0;
+      p->sigalarm_frame.a1 = p->trapframe->a1;
+      p->sigalarm_frame.a2 = p->trapframe->a2;
+      p->sigalarm_frame.a3 = p->trapframe->a3;
+      p->sigalarm_frame.a4 = p->trapframe->a4;
+      p->sigalarm_frame.a5 = p->trapframe->a5;
+      p->sigalarm_frame.a6 = p->trapframe->a6;
+      p->sigalarm_frame.a7 = p->trapframe->a7;
+
+      p->sigalarm_frame.s0 = p->trapframe->s0;
+      p->sigalarm_frame.s1 = p->trapframe->s1;
+      p->sigalarm_frame.s2 = p->trapframe->s2;
+      p->sigalarm_frame.s3 = p->trapframe->s3;
+      p->sigalarm_frame.s4 = p->trapframe->s4;
+      p->sigalarm_frame.s5 = p->trapframe->s5;
+      p->sigalarm_frame.s6 = p->trapframe->s6;
+      p->sigalarm_frame.s7 = p->trapframe->s7;
+      p->sigalarm_frame.s8 = p->trapframe->s8;
+      p->sigalarm_frame.s9 = p->trapframe->s9;
+      p->sigalarm_frame.s10 = p->trapframe->s10;
+      p->sigalarm_frame.s11 = p->trapframe->s11;
+      p->sigalarm_frame.epc = p->trapframe->epc;
+      p->trapframe->epc = p->sigalarm_frame.handler;
+    }
+    yield();
+  }
   usertrapret();
 }
 
