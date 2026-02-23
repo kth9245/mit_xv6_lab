@@ -19,6 +19,97 @@ static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
 
 static struct spinlock netlock;
 
+#define UDPQMAX 16
+#define NBOUND 64
+
+struct uptq {
+  int src_ip;
+  short src_port;
+  char *buf;
+  int len;
+};
+
+struct bound {
+  int port;
+  struct uptq q[UDPQMAX];
+  int qhead;
+  int qtail;
+};
+
+static struct bound bound[NBOUND];
+
+static int
+q_empty(struct bound *b)
+{
+  return b->qhead == b->qtail;
+}
+
+static int
+q_full(struct bound *b)
+{
+  return ((b->qtail + 1) % UDPQMAX) == b->qhead;
+}
+
+static int
+q_push(struct bound *b, int src_ip, short src_port, char *payload, int len)
+{
+  if(q_full(b))
+    return -1;
+
+  char *copy = kalloc();
+  if(copy == 0)
+    return -1;
+
+  if(len > PGSIZE) len = PGSIZE;
+  memmove(copy, payload, len);
+
+  int t = b->qtail;
+  if(b->q[t].buf){
+    kfree(b->q[t].buf);
+    b->q[t].buf = 0;
+  }
+
+  b->q[t].src_ip = src_ip;
+  b->q[t].src_port = src_port;
+  b->q[t].buf = copy;
+  b->q[t].len = len;
+
+  b->qtail = (b->qtail + 1) % UDPQMAX;
+  return 0;
+}
+
+static int
+q_pop(struct bound *b, int *src_ip, short *src_port, char **buf, int *len)
+{
+  if(q_empty(b))
+    return -1;
+
+  int h = b->qhead;
+
+  *src_ip = b->q[h].src_ip;
+  *src_port = b->q[h].src_port;
+  *buf = b->q[h].buf;
+  *len = b->q[h].len;
+
+  b->q[h].src_ip = 0;
+  b->q[h].src_port = 0;
+  b->q[h].buf = 0;
+  b->q[h].len = 0;
+
+  b->qhead = (b->qhead + 1) % UDPQMAX;
+  return 0;
+}
+
+int
+find_bound(int port)
+{
+  for(int i = 0; i < NBOUND; i++){
+    if(bound[i].port == port)
+      return i;
+  }
+  return -1;
+}
+
 void
 netinit(void)
 {
@@ -37,7 +128,29 @@ sys_bind(void)
   //
   // Your code here.
   //
-
+  int port;
+  argint(0, &port);
+  acquire(&netlock);
+  if (find_bound(port) >= 0){
+    release(&netlock);
+    return -1;
+  }
+  
+  for (int i = 0; i < NBOUND; i++){
+    if (bound[i].port == 0){
+      bound[i].port = port;
+      bound[i].qhead = 0;
+      bound[i].qtail = 0;
+      for (int j = 0; j < UDPQMAX; j++){
+        bound[i].q[j].src_ip = 0;
+        bound[i].q[j].src_port = 0;
+        bound[i].q[j].buf = 0;
+        bound[i].q[j].len = 0;
+      }
+      release(&netlock);
+      return 0;
+    }
+  }
   return -1;
 }
 
@@ -77,7 +190,60 @@ sys_recv(void)
   //
   // Your code here.
   //
-  return -1;
+  struct proc *p = myproc();
+  int dport;
+  uint64 srcaddr;
+  uint64 sportaddr;
+  uint64 bufaddr;
+  int maxlen;
+
+  argint(0, &dport);
+  argaddr(1, &srcaddr);
+  argaddr(2, &sportaddr);
+  argaddr(3, &bufaddr);
+  argint(4, &maxlen);
+
+  acquire(&netlock);
+
+  for(;;){
+    int idx = find_bound(dport);
+    if(idx < 0){
+      release(&netlock);
+      return -1;
+    }
+    struct bound *b = &bound[idx];
+    int src_ip;
+    short src_port;
+    char *kbuf;
+    int klen;
+
+    if(q_pop(b, &src_ip, &src_port, &kbuf, &klen) == 0){
+      int n = klen;
+      if(n > maxlen) n = maxlen;
+      if(n < 0) n = 0;
+
+      if(copyout(p->pagetable, bufaddr, kbuf, n) < 0){
+        if(kbuf) kfree(kbuf);
+        release(&netlock);
+        return -1;
+      }
+      if(copyout(p->pagetable, srcaddr, (char*)&src_ip, sizeof(src_ip)) < 0){
+        if(kbuf) kfree(kbuf);
+        release(&netlock);
+        return -1;
+      }
+      if(copyout(p->pagetable, sportaddr, (char*)&src_port, sizeof(src_port)) < 0){
+        if(kbuf) kfree(kbuf);
+        release(&netlock);
+        return -1;
+      }
+      if(kbuf) kfree(kbuf);
+      release(&netlock);
+      return n;
+    }
+
+    sleep(b, &netlock);
+  }
 }
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
@@ -191,7 +357,68 @@ ip_rx(char *buf, int len)
   //
   // Your code here.
   //
-  
+  if(len < (int)(sizeof(struct eth) + sizeof(struct ip))){
+    kfree(buf);
+    return;
+  }
+
+  struct eth *eth = (struct eth *)buf;
+  struct ip *ip = (struct ip *)(eth + 1);
+
+  int ihl = (ip->ip_vhl & 0x0f) * 4;
+  if(ihl < (int)sizeof(struct ip)){
+    kfree(buf);
+    return;
+  }
+
+  int iplen = ntohs(ip->ip_len);
+  int have = len - (int)sizeof(struct eth);
+  if(iplen > have || iplen < ihl){
+    kfree(buf);
+    return;
+  }
+
+  if(ip->ip_p != IPPROTO_UDP){
+    kfree(buf);
+    return;
+  }
+
+  if(iplen < ihl + (int)sizeof(struct udp)){
+    kfree(buf);
+    return;
+  }
+
+  struct udp *udp = (struct udp *)((char*)ip + ihl);
+  int ulen = ntohs(udp->ulen);
+  if(ulen < (int)sizeof(struct udp)){
+    kfree(buf);
+    return;
+  }
+  int udp_avail = iplen - ihl;
+  if(ulen > udp_avail){
+    kfree(buf);
+    return;
+  }
+
+  int dport = ntohs(udp->dport);
+  int sport = ntohs(udp->sport);
+  int payload_len = ulen - (int)sizeof(struct udp);
+  char *payload = (char *)(udp + 1);
+
+  int src_ip = ntohl(ip->ip_src);
+  short src_port = (short)sport;
+
+  acquire(&netlock);
+
+  int idx = find_bound(dport);
+  if(idx >= 0){
+    struct bound *b = &bound[idx];
+    if(q_push(b, src_ip, src_port, payload, payload_len) == 0){
+      wakeup(b);
+    }
+  }
+  release(&netlock);
+  kfree(buf);
 }
 
 //
